@@ -138,7 +138,7 @@ private final class OverlayController: NSObject, NSApplicationDelegate {
             if label.stringValue != text { label.stringValue = text }
             label.font = isTitle ? .systemFont(ofSize: 13, weight: .semibold)
                 : .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-            label.textColor = .white.withAlphaComponent(isTitle ? 1 : 0.84)
+            label.textColor = .white.withAlphaComponent(isTitle ? 0.88 : 0.72)
         }
         if !panel.isVisible {
             panel.orderFrontRegardless()
