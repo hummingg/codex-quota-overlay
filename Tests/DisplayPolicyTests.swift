@@ -17,11 +17,11 @@ enum DisplayPolicyTests {
         check(OverlayPolicy.countdown(to: now, now: now) == nil, "不假定已完成自然重置")
         let size = CGSize(width: 250, height: 48)
         let placed = OverlayPolicy.origin(size: size, window: window, viewport: viewport)
-        check(placed == CGPoint(x: -612, y: 734), "贴在 Codex 窗口右上角")
+        check(placed == CGPoint(x: -612, y: 82), "贴在 Codex 窗口右下角")
         let clipped = OverlayPolicy.origin(
-            size: size, window: CGRect(x: -180, y: 820, width: 900, height: 760), viewport: viewport
+            size: size, window: CGRect(x: -180, y: -80, width: 900, height: 760), viewport: viewport
         )
-        check(viewport.contains(CGRect(origin: clipped, size: size)), "跨显示器时不超出可见区")
+        check(clipped == CGPoint(x: -250, y: 40), "跨显示器时限制在可见区右下角")
         print("9 个显示策略用例通过")
     }
 

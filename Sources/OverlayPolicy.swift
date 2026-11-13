@@ -19,7 +19,7 @@ enum OverlayPolicy {
     static func origin(size: CGSize, window: CGRect, viewport: CGRect) -> CGPoint {
         CGPoint(
             x: max(viewport.minX, min(window.maxX - size.width - 12, viewport.maxX - size.width)),
-            y: max(viewport.minY, min(window.maxY - size.height - 48, viewport.maxY - size.height))
+            y: max(viewport.minY, min(window.minY + 12, viewport.maxY - size.height))
         )
     }
 }
