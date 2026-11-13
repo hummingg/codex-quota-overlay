@@ -1,23 +1,35 @@
 import Darwin
 import Foundation
 
-struct QuotaSnapshot: Equatable, Sendable {
+struct QuotaWindow: Equatable, Sendable {
     let usedPercent: Double
-    let resetsAt: Date
+    let resetsAt: Date?
+}
+
+enum QuotaCredits: Equatable, Sendable {
+    case balance(String)
+    case unlimited
+    case noBalance
+}
+
+struct QuotaSnapshot: Equatable, Sendable {
+    let fiveHour: QuotaWindow?
+    let weekly: QuotaWindow?
+    let credits: QuotaCredits?
 }
 
 enum QuotaClientError: LocalizedError {
     case cliUnavailable
     case timeout
     case rpcFailed
-    case weeklyUnavailable
+    case quotaUnavailable
 
     var errorDescription: String? {
         switch self {
         case .cliUnavailable: "找不到 Codex 内置命令行"
         case .timeout: "读取额度超时"
         case .rpcFailed: "无法读取 Codex 额度"
-        case .weeklyUnavailable: "未返回有效的周额度"
+        case .quotaUnavailable: "未返回可显示的 Codex 额度"
         }
     }
 }
@@ -33,29 +45,31 @@ struct QuotaClient: Sendable {
         self.timeout = timeout
     }
 
-    func readWeekly() async throws -> QuotaSnapshot {
-        try await Task.detached(priority: .utility) { try self.read() }.value
+    func read() async throws -> QuotaSnapshot {
+        try await Task.detached(priority: .utility) { try self.requestSnapshot() }.value
     }
 
-    static func decodeWeekly(_ data: Data) throws -> QuotaSnapshot {
-        guard let reply = try? JSONDecoder().decode(WeeklyReply.self, from: data), reply.id == 2,
+    static func decode(_ data: Data) throws -> QuotaSnapshot {
+        guard let reply = try? JSONDecoder().decode(QuotaReply.self, from: data), reply.id == 2,
               reply.error == nil, let result = reply.result else {
             throw QuotaClientError.rpcFailed
         }
         let legacy = result.rateLimits
         let fallback = legacy?.limitId == nil || legacy?.limitId == "codex" ? legacy : nil
-        guard let limits = result.rateLimitsByLimitId?["codex"] ?? fallback,
-              let window = [limits.primary, limits.secondary].compactMap({ $0 }).first(where: {
-                  $0.windowDurationMins == 10_080
-              }),
-              let used = window.usedPercent, (0...100).contains(used),
-              let reset = window.resetsAt, reset > 0 else {
-            throw QuotaClientError.weeklyUnavailable
+        guard let limits = result.rateLimitsByLimitId?.codex ?? fallback else {
+            throw QuotaClientError.quotaUnavailable
         }
-        return QuotaSnapshot(usedPercent: used, resetsAt: Date(timeIntervalSince1970: TimeInterval(reset)))
+        let windows = [limits.primary, limits.secondary].compactMap { $0 }
+        let fiveHour = windows.first { $0.windowDurationMins == 300 && $0.displayWindow != nil }?.displayWindow
+        let weekly = windows.first { $0.windowDurationMins == 10_080 && $0.displayWindow != nil }?.displayWindow
+        let credits = limits.credits?.displayBalance
+        guard fiveHour != nil || weekly != nil || credits != nil else {
+            throw QuotaClientError.quotaUnavailable
+        }
+        return QuotaSnapshot(fiveHour: fiveHour, weekly: weekly, credits: credits)
     }
 
-    private func read() throws -> QuotaSnapshot {
+    private func requestSnapshot() throws -> QuotaSnapshot {
         guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
             throw QuotaClientError.cliUnavailable
         }
@@ -91,25 +105,74 @@ struct QuotaClient: Sendable {
         _ = try transport.receive(id: 1)
         try transport.send(#"{"method":"initialized"}"#)
         try transport.send(#"{"id":2,"method":"account/rateLimits/read","params":null}"#)
-        return try Self.decodeWeekly(transport.receive(id: 2))
+        return try Self.decode(transport.receive(id: 2))
     }
 }
 
-private struct WeeklyReply: Decodable {
+private struct QuotaReply: Decodable {
     struct RPCError: Decodable {}
     struct Payload: Decodable {
         let rateLimits: Limits?
-        let rateLimitsByLimitId: [String: Limits]?
+        let rateLimitsByLimitId: Buckets?
+    }
+    struct Buckets: Decodable {
+        let codex: Limits?
     }
     struct Limits: Decodable {
         let limitId: String?
         let primary: Window?
         let secondary: Window?
+        let credits: Credits?
+
+        private enum CodingKeys: String, CodingKey {
+            case limitId, primary, secondary, credits
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            limitId = try values.decodeIfPresent(String.self, forKey: .limitId)
+            // 一个窗口或余额的坏字段不应吞掉另外两个正常值。
+            primary = try? values.decode(Window.self, forKey: .primary)
+            secondary = try? values.decode(Window.self, forKey: .secondary)
+            credits = try? values.decode(Credits.self, forKey: .credits)
+        }
     }
     struct Window: Decodable {
-        let usedPercent: Double?
-        let windowDurationMins: Int?
+        let usedPercent: Double
+        let windowDurationMins: Int
         let resetsAt: Int64?
+
+        private enum CodingKeys: String, CodingKey {
+            case usedPercent, windowDurationMins, resetsAt
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            usedPercent = try values.decode(Double.self, forKey: .usedPercent)
+            windowDurationMins = try values.decode(Int.self, forKey: .windowDurationMins)
+            resetsAt = try? values.decode(Int64.self, forKey: .resetsAt)
+        }
+
+        var displayWindow: QuotaWindow? {
+            guard (0...100).contains(usedPercent) else { return nil }
+            let reset = resetsAt.flatMap { $0 > 0 ? Date(timeIntervalSince1970: TimeInterval($0)) : nil }
+            return QuotaWindow(usedPercent: usedPercent, resetsAt: reset)
+        }
+    }
+    struct Credits: Decodable {
+        let balance: String?
+        let hasCredits: Bool?
+        let unlimited: Bool?
+
+        var displayBalance: QuotaCredits? {
+            if unlimited == true { return .unlimited }
+            if let balance {
+                let text = balance.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let value = Double(text), value.isFinite, value >= 0 else { return nil }
+                return .balance(text)
+            }
+            return hasCredits == false ? .noBalance : nil
+        }
     }
     let id: Int
     let error: RPCError?
@@ -119,7 +182,7 @@ private struct WeeklyReply: Decodable {
 private struct JSONLineTransport {
     private struct Header: Decodable {
         let id: Int
-        let error: WeeklyReply.RPCError?
+        let error: QuotaReply.RPCError?
     }
 
     let writer: FileHandle

@@ -8,10 +8,13 @@ enum OverlayApp {
     @MainActor static func main() async {
         if CommandLine.arguments.contains("--check") {
             do {
-                let quota = try await QuotaClient().readWeekly()
-                print("周额度已用 \(quota.usedPercent)%；下次重置 \(ISO8601DateFormatter().string(from: quota.resetsAt))")
+                let quota = try await QuotaClient().read()
+                let formatter = ISO8601DateFormatter()
+                for row in OverlayPolicy.rows(snapshot: quota, failed: false, now: Date(), formatDate: formatter.string(from:)) {
+                    print(row.detail.map { "\(row.title) · \($0)" } ?? row.title)
+                }
             } catch {
-                fputs("无法读取 Codex 周额度：\(error.localizedDescription)\n", stderr)
+                fputs("无法读取 Codex 额度：\(error.localizedDescription)\n", stderr)
                 exit(1)
             }
             return
@@ -33,9 +36,8 @@ private final class QuotaPanel: NSPanel {
 private final class OverlayController: NSObject, NSApplicationDelegate {
     private let client = QuotaClient()
     private let logger = Logger(subsystem: "com.hummingg.codex-quota-overlay", category: "visibility")
-    private let size = CGSize(width: 250, height: 50)
-    private let headline = NSTextField(labelWithString: "Codex · 周额度")
-    private let detail = NSTextField(labelWithString: "正在读取…")
+    private let width: CGFloat = 250
+    private let labels = (0..<5).map { _ in NSTextField(labelWithString: "") }
     private let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
@@ -50,10 +52,10 @@ private final class OverlayController: NSObject, NSApplicationDelegate {
     private var failed = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let rect = CGRect(origin: .zero, size: size)
+        let rect = CGRect(x: 0, y: 0, width: width, height: 50)
         panel = QuotaPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel],
                            backing: .buffered, defer: false)
-        panel.title = "Codex 周额度浮窗"
+        panel.title = "Codex 额度浮窗"
         panel.level = .floating
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -63,15 +65,11 @@ private final class OverlayController: NSObject, NSApplicationDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
 
         let surface = OverlaySurface(frame: rect)
-        headline.font = .systemFont(ofSize: 13, weight: .semibold)
-        headline.textColor = .white
-        headline.frame = CGRect(x: 12, y: 27, width: 226, height: 17)
-        detail.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        detail.textColor = .white.withAlphaComponent(0.84)
-        detail.frame = CGRect(x: 12, y: 8, width: 226, height: 15)
-        detail.lineBreakMode = .byTruncatingTail
-        surface.addSubview(headline)
-        surface.addSubview(detail)
+        for label in labels {
+            label.lineBreakMode = .byTruncatingTail
+            surface.addSubview(label)
+        }
+        surface.autoresizingMask = [.width, .height]
         panel.contentView = surface
 
         let workspace = NSWorkspace.shared.notificationCenter
@@ -92,9 +90,15 @@ private final class OverlayController: NSObject, NSApplicationDelegate {
     }
 
     private func update() {
+        let now = Date()
+        let rows = OverlayPolicy.rows(snapshot: snapshot, failed: failed, now: now, formatDate: dateFormatter.string(from:))
+        let lines: [(text: String, isTitle: Bool)] = rows.flatMap { row in
+            [(row.title, true)] + (row.detail.map { [($0, false)] } ?? [])
+        }
+        let size = CGSize(width: width, height: CGFloat(lines.count * 17 + (rows.count - 1) * 4 + 16))
         guard let front = NSWorkspace.shared.frontmostApplication,
               OverlayPolicy.isCodex(front.bundleIdentifier),
-              let placement = position(for: front.processIdentifier)
+              let placement = position(for: front.processIdentifier, size: size)
         else {
             if panel.isVisible {
                 panel.orderOut(nil)
@@ -102,14 +106,14 @@ private final class OverlayController: NSObject, NSApplicationDelegate {
             }
             return
         }
-        let now = Date()
-        let passedReset = snapshot.map { $0.resetsAt <= now } ?? false
+        let passedReset = [snapshot?.fiveHour?.resetsAt, snapshot?.weekly?.resetsAt]
+            .compactMap { $0 }.contains { $0 <= now }
         let refreshInterval: TimeInterval = passedReset ? 15 : 90
         if refreshTask == nil && lastAttempt.map({ now.timeIntervalSince($0) >= refreshInterval }) != false {
             lastAttempt = now
             refreshTask = Task {
                 do {
-                    snapshot = try await client.readWeekly()
+                    snapshot = try await client.read()
                     failed = false
                 } catch {
                     failed = true
@@ -118,21 +122,31 @@ private final class OverlayController: NSObject, NSApplicationDelegate {
                 update()
             }
         }
-        if let quota = snapshot, let countdown = OverlayPolicy.countdown(to: quota.resetsAt, now: now) {
-            headline.stringValue = "Codex · 周剩 \(Int((100 - quota.usedPercent).rounded()))%\(failed ? " · 旧数据" : "")"
-            detail.stringValue = "\(dateFormatter.string(from: quota.resetsAt)) 重置 · \(countdown)"
-        } else {
-            headline.stringValue = "Codex · 周额度"
-            detail.stringValue = failed ? "暂时无法读取额度" : (snapshot == nil ? "正在读取…" : "等待确认下一次重置…")
+        let frame = CGRect(origin: placement, size: size)
+        if panel.frame != frame {
+            panel.setFrame(frame, display: true)
+            panel.contentView?.needsDisplay = true
         }
-        if panel.frame.origin != placement { panel.setFrameOrigin(placement) }
+        var y = size.height - 8
+        for (index, label) in labels.enumerated() {
+            label.isHidden = index >= lines.count
+            guard index < lines.count else { continue }
+            let (text, isTitle) = lines[index]
+            if index > 0 && isTitle { y -= 4 }
+            y -= 17
+            label.frame = CGRect(x: 12, y: y, width: width - 24, height: 17)
+            if label.stringValue != text { label.stringValue = text }
+            label.font = isTitle ? .systemFont(ofSize: 13, weight: .semibold)
+                : .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            label.textColor = .white.withAlphaComponent(isTitle ? 1 : 0.84)
+        }
         if !panel.isVisible {
             panel.orderFrontRegardless()
             logger.notice("shown")
         }
     }
 
-    private func position(for pid: pid_t) -> CGPoint? {
+    private func position(for pid: pid_t, size: CGSize) -> CGPoint? {
         let screens = NSScreen.screens
         guard let primary = screens.first else { return nil }
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)

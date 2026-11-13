@@ -23,7 +23,7 @@ if [[ -f "$swift_headers/module.modulemap" && -f "$swift_headers/bridging.module
 fi
 
 if [[ "${1:-}" == --test ]]; then
-    xcrun swiftc "${swift_flags[@]}" Sources/OverlayPolicy.swift Tests/DisplayPolicyTests.swift -o build/display-tests
+    xcrun swiftc "${swift_flags[@]}" Sources/QuotaClient.swift Sources/OverlayPolicy.swift Tests/DisplayPolicyTests.swift -o build/display-tests
     build/display-tests
     xcrun swiftc "${swift_flags[@]}" Sources/OverlaySurface.swift Tests/OverlaySurfaceTests.swift -o build/surface-tests
     build/surface-tests
